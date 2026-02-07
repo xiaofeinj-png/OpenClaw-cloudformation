@@ -1,0 +1,4 @@
+template-file-path: cloudformation/base/openclaw-core.yml
+parameters: {}
+tags:
+  Project: Openclaw
