@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OpenClaw Core Platform - Base CloudFormation Deployment Template (EC2 + VPC + IAM + Security Groups)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: OpenClaw Instance Configuration
+        Parameters:
+          - InstanceType
+          - InstanceCount
+          - KeyName
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to SSH into OpenClaw nodes
+    ConstraintDescription: Must be an existing EC2 Key Pair in this region.
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - c5.large
+      - c5.xlarge
+    Description: EC2 instance type for OpenClaw core services.
+
+  InstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of OpenClaw core instances.
+
+  VpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+    AllowedPattern: ^([0-9]+\.){3}[0-9]+\/[0-9]+$
+    Description: CIDR block for the OpenClaw VPC.
+
+  SubnetCidr:
+    Type: String
+    Default: 10.10.1.0/24
+    AllowedPattern: ^([0-9]+\.){3}[0-9]+\/[0-9]+$
+    Description: CIDR block for the OpenClaw public subnet.
+
+Resources:
+  # VPC
+  OpenClawVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: OpenClaw-Core-VPC
+
+  # Internet Gateway
+  OpenClawIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: OpenClaw-IGW
+
+  # Attach IGW to VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref OpenClawVPC
+      InternetGatewayId: !Ref OpenClawIGW
+
+  # Public Subnet
+  OpenClawPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OpenClawVPC
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: OpenClaw-Public-Subnet
+
+  # Route Table
+  OpenClawRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OpenClawVPC
+      Tags:
+        - Key: Name
+          Value: OpenClaw-RouteTable
+
+  # Public Route
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref OpenClawRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref OpenClawIGW
+
+  # Associate Subnet to Route Table
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OpenClawPublicSubnet
+      RouteTableId: !Ref OpenClawRouteTable
+
+  # Security Group for OpenClaw (HTTP/HTTPS/SSH/API)
+  OpenClawSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: OpenClaw Core Access (SSH, HTTP, HTTPS, API Ports)
+      VpcId: !Ref OpenClawVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: OpenClaw-SG
+
+  # IAM Instance Profile for OpenClaw (basic cloud permissions)
+  OpenClawInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Path: /
+      Tags:
+        - Key: Name
+          Value: OpenClaw-Instance-Role
+
+  OpenClawInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref OpenClawInstanceRole
+
+  # OpenClaw Core EC2 Instance(s)
+  OpenClawCoreInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref OpenClawInstanceProfile
+      SubnetId: !Ref OpenClawPublicSubnet
+      SecurityGroupIds:
+        - !Ref OpenClawSecurityGroup
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker git
+          systemctl enable docker
+          systemctl start docker
+          echo "OpenClaw base environment ready - deploy OpenClaw containers via Git/Docker"
+      Tags:
+        - Key: Name
+          Value: OpenClaw-Core-Node
+
+Outputs:
+  VpcId:
+    Value: !Ref OpenClawVPC
+    Description: OpenClaw VPC ID
+
+  PublicSubnetId:
+    Value: !Ref OpenClawPublicSubnet
+    Description: OpenClaw Public Subnet ID
+
+  SecurityGroupId:
+    Value: !Ref OpenClawSecurityGroup
+    Description: OpenClaw Security Group ID
+
+  OpenClawCoreInstancePublicIP:
+    Value: !GetAtt OpenClawCoreInstance.PublicIp
+    Description: OpenClaw Core Node Public IP
+
+  OpenClawCoreInstanceDNS:
+    Value: !GetAtt OpenClawCoreInstance.PublicDnsName
+    Description: OpenClaw Core Node Public DNS
